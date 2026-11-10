@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # The SDK releases its modules together, so one pull request covers them.
+      aws:
+        patterns: ["github.com/aws/*"]
+
+  # Actions are pinned to commit SHAs. Dependabot moves the SHA and the tag
+  # in its comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

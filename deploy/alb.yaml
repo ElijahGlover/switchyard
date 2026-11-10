@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: switchyard multi-CDN router behind an existing Application Load Balancer. Reads routing config and MMDB databases from S3.
+
+# The load balancer must keep its default X-Forwarded-For handling: append
+# the client address, without a port. The router trusts only the last entry,
+# so "preserve" would let a client choose its address, and "remove" or a
+# client port would make every request a 400.
+
+Parameters:
+  Bucket:
+    Type: String
+    Description: Bucket holding the routing config and databases.
+  Prefix:
+    Type: String
+    Default: routing
+    Description: Folder in the bucket for config.yaml and its databases.
+  RefreshInterval:
+    Type: String
+    Default: 10s
+    Description: How often each container revalidates with S3 in the background (Go duration).
+  WarmUpSchedule:
+    Type: String
+    Default: rate(1 minute)
+    Description: How often the scheduler invokes the function to keep a container warm and refreshed. One minute is the shortest rate.
+  ReservedConcurrency:
+    Type: Number
+    Default: 0
+    Description: Caps concurrent executions so a load test cannot run away. 0 leaves it unset.
+  DebugKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    AllowedPattern: "^$|^[A-Za-z0-9_-]{32,}$"
+    ConstraintDescription: must be empty, or at least 32 letters, digits, hyphens or underscores, such as from openssl rand -hex 16.
+    Description: A request that sends this in X-Switchyard-Debug is shown how its route was chosen. Empty turns the header off.
+  ListenerArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:elasticloadbalancing:[a-z0-9-]+:[0-9]{12}:listener/app/.+$"
+    ConstraintDescription: must be the ARN of an Application Load Balancer listener.
+    Description: Listener of the existing load balancer, in this account and Region.
+  Priority:
+    Type: Number
+    MinValue: 1
+    MaxValue: 50000
+    Description: Priority of the new listener rule. No other rule on the listener may use it.
+  HostHeaders:
+    Type: CommaDelimitedList
+    Description: Hostnames the listener rule sends to the router, at most five, such as video.example.com. Each needs rules under hosts in config.yaml.
+
+Conditions:
+  CapConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+  Debug: !Not [!Equals [!Ref DebugKey, ""]]
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: read-routing
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/*
+              # Lets a missing object come back as NoSuchKey instead of AccessDenied.
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub ${Prefix}/*
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}
+      RetentionInDays: 3
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref AWS::StackName
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      Handler: bootstrap
+      Code: ../build/router.zip
+      MemorySize: 256
+      Timeout: 5
+      Role: !GetAtt Role.Arn
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      ReservedConcurrentExecutions: !If [CapConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      Environment:
+        Variables:
+          CONFIG_BUCKET: !Ref Bucket
+          CONFIG_KEY: !Sub ${Prefix}/config.yaml
+          REFRESH_INTERVAL: !Ref RefreshInterval
+          # No CLIENT_IP: ALB events always use the last X-Forwarded-For
+          # entry, which the load balancer appends.
+          DEBUG_KEY: !If [Debug, !Ref DebugKey, !Ref AWS::NoValue]
+
+  # The function must allow the load balancer before it can be registered,
+  # but a target group's ARN ends in an ID that exists only once it does.
+  # Naming the target group lets this permission match its ARN in advance.
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt Function.Arn
+      Action: lambda:InvokeFunction
+      Principal: elasticloadbalancing.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/${AWS::StackName}/*
+
+  # Its name is the stack's, so the stack name can be at most 32 characters.
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: InvokePermission
+    Properties:
+      Name: !Ref AWS::StackName
+      TargetType: lambda
+      Targets:
+        - Id: !GetAtt Function.Arn
+      # The router has no dependency to check, and each check is a billed
+      # invocation.
+      HealthCheckEnabled: false
+
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ListenerArn
+      Priority: !Ref Priority
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values: !Ref HostHeaders
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # Keeps one container warm and refreshes its routes while it is awake. A
+  # scheduled invocation reaches a single container, so this does not replace
+  # the per-container background refresh; it covers the container that would
+  # otherwise sit frozen with stale routes between bursts of traffic.
+  WarmUp:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: !Sub Keeps ${AWS::StackName} warm and its routes fresh.
+      ScheduleExpression: !Ref WarmUpSchedule
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt Function.Arn
+        RoleArn: !GetAtt WarmUpRole.Arn
+        Input: '{"warm": true}'
+        # A missed warm-up is replaced by the next one, so never queue retries.
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 60
+
+  WarmUpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-router
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt Function.Arn
+
+  # The scheduler invokes asynchronously. A failed warm-up returns an error
+  # for the metrics, and Lambda must not retry it on top of the next one.
+  WarmUpInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref Function
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+
+Outputs:
+  TargetGroup:
+    Value: !Ref TargetGroup
+  Function:
+    Value: !Ref Function

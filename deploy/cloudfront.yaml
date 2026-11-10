@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: switchyard multi-CDN router behind CloudFront, with no caching. Reads routing config and MMDB databases from S3.
+
+# CloudFront is the only way in. The Function URL takes IAM auth and allows
+# only this distribution, which signs each request with Origin Access
+# Control, so CloudFront-Viewer-Address can be trusted for the client.
+
+Parameters:
+  Bucket:
+    Type: String
+    Description: Bucket holding the routing config and databases.
+  Prefix:
+    Type: String
+    Default: routing
+    Description: Folder in the bucket for config.yaml and its databases.
+  RefreshInterval:
+    Type: String
+    Default: 10s
+    Description: How often each container revalidates with S3 in the background (Go duration).
+  WarmUpSchedule:
+    Type: String
+    Default: rate(1 minute)
+    Description: How often the scheduler invokes the function to keep a container warm and refreshed. One minute is the shortest rate.
+  ReservedConcurrency:
+    Type: Number
+    Default: 0
+    Description: Caps concurrent executions so a load test cannot run away. 0 leaves it unset.
+  DebugKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    AllowedPattern: "^$|^[A-Za-z0-9_-]{32,}$"
+    ConstraintDescription: must be empty, or at least 32 letters, digits, hyphens or underscores, such as from openssl rand -hex 16.
+    Description: A request that sends this in X-Switchyard-Debug is shown how its route was chosen. Empty turns the header off.
+  Aliases:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Hostnames the distribution answers for, such as video.example.com. Each needs rules under hosts in config.yaml. Empty leaves only the distribution's cloudfront.net name.
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate in us-east-1 covering every alias. Required with Aliases.
+
+Conditions:
+  CapConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+  Debug: !Not [!Equals [!Ref DebugKey, ""]]
+  HasAliases: !Not [!Equals [!Join ["", !Ref Aliases], ""]]
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: read-routing
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/${Prefix}/*
+              # Lets a missing object come back as NoSuchKey instead of AccessDenied.
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}
+                Condition:
+                  StringLike:
+                    s3:prefix: !Sub ${Prefix}/*
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}
+      RetentionInDays: 3
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref AWS::StackName
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      Handler: bootstrap
+      Code: ../build/router.zip
+      MemorySize: 256
+      Timeout: 5
+      Role: !GetAtt Role.Arn
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      ReservedConcurrentExecutions: !If [CapConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      Environment:
+        Variables:
+          CONFIG_BUCKET: !Ref Bucket
+          CONFIG_KEY: !Sub ${Prefix}/config.yaml
+          REFRESH_INTERVAL: !Ref RefreshInterval
+          # Safe only because the URL below accepts this distribution alone.
+          CLIENT_IP: cloudfront
+          DEBUG_KEY: !If [Debug, !Ref DebugKey, !Ref AWS::NoValue]
+
+  Url:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt Function.Arn
+      AuthType: AWS_IAM
+
+  # Origin Access Control needs both statements, each limited to this
+  # distribution.
+  UrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+      FunctionUrlAuthType: AWS_IAM
+
+  UrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-${AWS::Region}
+        Description: Signs CloudFront's requests to the router's Function URL.
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # A Function URL needs its own Host, so the viewer's hostname travels in
+  # X-Forwarded-Host. Setting it here, over anything the viewer sent, means
+  # the viewer cannot pick a host the distribution does not answer for.
+  ForwardedHost:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub ${AWS::StackName}-${AWS::Region}
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Copies the viewer's Host into X-Forwarded-Host.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var host = request.headers.host;
+          if (host) {
+            request.headers['x-forwarded-host'] = { value: host.value };
+          } else {
+            delete request.headers['x-forwarded-host'];
+          }
+          return request;
+        }
+
+  # Exactly what the router reads. The viewer's Host stays behind, so
+  # CloudFront sends the Function URL's own.
+  OriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub ${AWS::StackName}-${AWS::Region}
+        Comment: Headers and query strings the switchyard router reads.
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers: [CloudFront-Viewer-Address, X-Forwarded-Host, X-Switchyard-Debug]
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: none
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${AWS::StackName} router
+        Aliases: !If [HasAliases, !Ref Aliases, !Ref AWS::NoValue]
+        ViewerCertificate: !If
+          - HasAliases
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - Id: router
+            DomainName: !Select [2, !Split ["/", !GetAtt Url.FunctionUrl]]
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: router
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          # Each answer belongs to one client, so nothing is cached. This is
+          # the managed CachingDisabled policy.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: !Ref OriginRequestPolicy
+          Compress: false
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt ForwardedHost.FunctionMetadata.FunctionARN
+
+  # Keeps one container warm and refreshes its routes while it is awake. A
+  # scheduled invocation reaches a single container, so this does not replace
+  # the per-container background refresh; it covers the container that would
+  # otherwise sit frozen with stale routes between bursts of traffic.
+  WarmUp:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: !Sub Keeps ${AWS::StackName} warm and its routes fresh.
+      ScheduleExpression: !Ref WarmUpSchedule
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt Function.Arn
+        RoleArn: !GetAtt WarmUpRole.Arn
+        Input: '{"warm": true}'
+        # A missed warm-up is replaced by the next one, so never queue retries.
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 60
+
+  WarmUpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-router
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt Function.Arn
+
+  # The scheduler invokes asynchronously. A failed warm-up returns an error
+  # for the metrics, and Lambda must not retry it on top of the next one.
+  WarmUpInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref Function
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+
+Outputs:
+  Url:
+    Value: !Sub https://${Distribution.DomainName}
+  DomainName:
+    Description: Point each alias here with a CNAME or alias record.
+    Value: !GetAtt Distribution.DomainName
+  Function:
+    Value: !Ref Function

@@ -1,0 +1,5 @@
+prefix,network,location
+203.0.113.0/25,onnet,bne
+203.0.113.128/25,onnet,mel
+198.51.100.0/24,onnet,syd
+2001:db8:100::/40,onnet,mel

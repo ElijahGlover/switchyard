@@ -1,0 +1,68 @@
+# Routing config. Lives next to its databases in S3:
+#
+#   s3://<bucket>/routing/config.yaml
+#   s3://<bucket>/routing/asn.mmdb
+#   s3://<bucket>/routing/netmap.mmdb
+#
+# Check it before uploading:
+#
+#   go run ./cmd/validate examples/config.yaml
+#   go run ./cmd/validate -host video.example.com -ip 203.0.113.7 examples/config.yaml
+
+# MMDB files, relative to this file. Any MMDB works: build your own from CSV
+# with mkmmdb, or drop in a third-party database such as IPinfo Lite (check
+# its field names with mmdbinspect and point the token paths at them).
+databases:
+  asn: asn.mmdb
+  netmap: netmap.mmdb
+
+# Tokens are fields read from a database for the client IP. A missing field,
+# or a value that is not a DNS label, gives the default.
+tokens:
+  asn:      { db: asn,    path: [asn],      default: none }
+  network:  { db: netmap, path: [network],  default: offnet }
+  location: { db: netmap, path: [location], default: syd }
+
+# Peers give sets of a token's values a label. A client whose ASN is in a
+# set gets that label, and any other client gets the default. Rules and
+# targets use a peer like any token: { peer: partner } or "{peer}.example.com".
+peers:
+  peer:
+    token: asn
+    default: other
+    labels:
+      partner: [AS64500, AS64501]
+
+# Redirects can only point under these suffixes.
+allowed_suffixes: [.example.com, .example.net]
+
+# Targets to blackhole, as written below or as rendered. A client whose
+# target is disabled gets 401 and is not sent anywhere else; every other
+# client keeps its target. To move viewers off a CDN instead, take it out of
+# the rule's targets.
+#
+#   disabled: [bne.edge.example.com]            one PoP
+#   disabled: ["{location}.edge.example.com"]   every PoP
+#   disabled: [cdn-b.example.net]               one CDN
+disabled: []
+
+# Rules for each incoming hostname, checked in order. Quote targets that
+# start with a placeholder, or YAML reads the braces as a mapping.
+hosts:
+  video.example.com:
+    # On-net viewers go to their nearest in-house PoP.
+    - when: { network: onnet }
+      targets:
+        "{location}.edge.example.com": 100
+
+    # Pin partner networks to CDN B.
+    - when: { peer: partner }
+      targets:
+        cdn-b.example.net: 100
+
+    - targets: &commercial
+        cdn-a.example.net: 70
+        cdn-b.example.net: 30
+
+  live.example.com:
+    - targets: *commercial
