@@ -22,6 +22,31 @@ client ─┬─► Function URL ───────────────�
 
 Each front door is its own stack, so you deploy the one you need. See [Building and deploying](#building-and-deploying).
 
+## Why
+
+### Why more than one CDN
+
+A CDN has limits. It may not reach every region a service needs, its internal network may be saturated, or its edge caches may lack the capacity for a large catalogue. It can also fail. A [2025 SMPTE paper on content steering](https://reznik.org/papers/JMI2025_Content_Steering.pdf) gives these as the reasons large streaming operators increasingly use several CDNs, for better reliability, scale and quality of experience. 
+
+### Why not one hostname
+
+One way to add a second CDN is DNS. Players keep one hostname, such as `video.example.com`, and the DNS provider answers each lookup with a CNAME to one CDN or another. The SMPTE paper calls this the simplest method, because the video URL never changes. It has three problems:
+
+- **It sees the resolver, not the viewer.** An authoritative server sees the address of the resolver that asked, which [can be far from the viewer](https://www.rfc-editor.org/rfc/rfc7871). EDNS Client Subnet passes on part of the viewer's address, but only if the resolver sends it, and [Cloudflare's public resolver does not](https://developers.cloudflare.com/1.1.1.1/faq/).
+- **Answers outlive their TTL.** A [2023 measurement study](https://ttl-violation-study.github.io) found 8.74% of the resolvers it tested keeping answers longer than their TTL. The SMPTE paper puts a DNS switch at 5 to 15 minutes when a CDN fails.
+- **Every CDN needs a certificate for the same name.** When each CDN automates its certificate with a DNS challenge, `_acme-challenge` [can be delegated by CNAME to only one of them](https://www.fastly.com/blog/smarter-acme-challenge-for-multi-cdn-world). A newer challenge, dns-account-01, is designed to fix this.
+
+### Why a redirect
+
+With switchyard, each CDN keeps its own hostname, such as `cdn-a.example.net`, with its own certificate and settings. The player asks the router once, at the start of a session, and gets a `302` to one of them.
+
+- It routes on the viewer's own address, read from the front door, not on a resolver's.
+- The answer is marked `no-store`, so there is no cache to wait out. Busy containers pick up a new config within 10 seconds of an upload.
+- A viewer gets the same CDN from every container, so they do not bounce between CDNs from one session to the next.
+- Every answer can be explained. `cmd/validate` shows which CDN an address gets, and `X-Version` names the config that sent it.
+
+The cost is one extra round trip when a session starts, and a session already playing stays on its CDN. To move those, HLS and DASH now define [content steering](https://reznik.org/papers/JMI2025_Content_Steering.pdf), which the player must support. switchyard does not implement it.
+
 ## Features
 
 - **Routes on data you control.** A rule can match anything an MMDB can hold: an ASN, a network name, a PoP. Build your own databases from CSV, or use a third-party one.
