@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.17
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.9
 	github.com/maxmind/mmdbwriter v1.2.0
-	github.com/oschwald/maxminddb-golang/v2 v2.9.0
+	github.com/oschwald/maxminddb-golang/v2 v2.9.1
 	go.yaml.in/yaml/v3 v3.0.6
 )
 
@@ -29,5 +29,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.51.9 // indirect
 	github.com/aws/smithy-go v1.28.8 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 )
